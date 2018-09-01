@@ -302,8 +302,8 @@ int opt_T1Vol[MCOMPAT_CONFIG_MAX_CHAIN_NUM] = {
 int opt_T1VID[MCOMPAT_CONFIG_MAX_CHAIN_NUM] = {};
 bool opt_T1auto = true;
 bool opt_T1_efficient;
-bool opt_T1_factory;
 bool opt_T1_performance;
+int opt_T1_target = 100;
 #endif
 #if defined(USE_ANT_S1) || defined(USE_ANT_S2)
 char *opt_bitmain_options;
@@ -1731,14 +1731,17 @@ static struct opt_table opt_config_table[] = {
 			opt_set_bool, &opt_T1_efficient,
 		        "Tune Dragonmint T1 per chain voltage and frequency for optimal efficiency"),
 	OPT_WITHOUT_ARG("--T1factory",
-			opt_set_bool, &opt_T1_factory,
-			"Tune Dragonmint T1 per chain voltage and frequency by factory autotune strategy"),
+			opt_set_invbool, &opt_T1auto,
+		        opt_hidden),
 	OPT_WITHOUT_ARG("--T1noauto",
 			opt_set_invbool, &opt_T1auto,
 			"Disable Dragonmint T1 per chain auto voltage and frequency tuning"),
 	OPT_WITHOUT_ARG("--T1performance",
 			opt_set_bool, &opt_T1_performance,
 		        "Tune Dragonmint T1 per chain voltage and frequency for maximum performance"),
+	OPT_WITH_ARG("--T1fantarget",
+			opt_set_intval, opt_show_intval, &opt_T1_target,
+			"Throttle T1 frequency to keep fan less than target fan speed"),
 	OPT_WITH_ARG("--T1Pll1",
 		     set_int_0_to_9999, opt_show_intval, &opt_T1Pll[0],
 	            "Set PLL Clock 1 in Dragonmint T1 broad 1 chip (-1: 1000MHz, >0:Lookup PLL table)"),
@@ -4496,6 +4499,22 @@ const
 #endif
 char **initial_args;
 
+static void *raise_thread(void __maybe_unused *arg)
+{
+	raise(SIGTERM);
+	return NULL;
+}
+
+/* This provides a mechanism for driver threads to initiate a shutdown without
+ * the cyclical problem of the shutdown path being cancelled while the driver
+ * thread shuts down.*/
+void raise_cgminer(void)
+{
+	pthread_t pth;
+
+	pthread_create(&pth, NULL, raise_thread, NULL);
+}
+
 static void clean_up(bool restarting);
 
 void app_restart(void)
@@ -5123,16 +5142,12 @@ static void discard_stale(void)
  */
 int restart_wait(struct thr_info *thr, unsigned int mstime)
 {
-	struct timeval now, then, tdiff;
-	struct timespec abstime;
+	struct timespec abstime, tdiff;
 	int rc;
 
-	tdiff.tv_sec = mstime / 1000;
-	tdiff.tv_usec = mstime * 1000 - (tdiff.tv_sec * 1000000);
-	cgtime(&now);
-	timeradd(&now, &tdiff, &then);
-	abstime.tv_sec = then.tv_sec;
-	abstime.tv_nsec = then.tv_usec * 1000;
+	cgcond_time(&abstime);
+	ms_to_timespec(&tdiff, mstime);
+	timeraddspec(&abstime, &tdiff);
 
 	mutex_lock(&restart_lock);
 	if (thr->work_restart)
@@ -6871,7 +6886,7 @@ static void *stratum_sthread(void *userdata)
 		if (unlikely(pool->removed))
 			break;
 
-		work = tq_pop(pool->stratum_q, NULL);
+		work = tq_pop(pool->stratum_q);
 		if (unlikely(!work))
 			quit(1, "Stratum q returned empty work");
 
@@ -7330,15 +7345,13 @@ static struct work *hash_pop(bool blocking)
 		if (!blocking)
 			goto out_unlock;
 		do {
-			struct timespec then;
-			struct timeval now;
+			struct timespec abstime, tdiff = {10, 0};
 			int rc;
 
-			cgtime(&now);
-			then.tv_sec = now.tv_sec + 10;
-			then.tv_nsec = now.tv_usec * 1000;
+			cgcond_time(&abstime);
+			timeraddspec(&abstime, &tdiff);
 			pthread_cond_signal(&gws_cond);
-			rc = pthread_cond_timedwait(&getq->cond, stgd_lock, &then);
+			rc = pthread_cond_timedwait(&getq->cond, stgd_lock, &abstime);
 			/* Check again for !no_work as multiple threads may be
 				* waiting on this condition and another may set the
 				* bool separately. */
@@ -8273,17 +8286,10 @@ struct work *clone_queued_work_bymidstate(struct cgpu_info *cgpu, char *midstate
  * given que hashtable. Code using this function must be able
  * to handle NULL as a return which implies there is no matching work.
  * The calling function must lock access to the que if it is required. */
-struct work *__find_work_byid(struct work *que, uint32_t id)
+struct work *__find_work_byid(struct work *queue, uint32_t id)
 {
-	struct work *work, *tmp, *ret = NULL;
-
-	HASH_ITER(hh, que, work, tmp) {
-		if (work->id == id) {
-			ret = work;
-			break;
-		}
-	}
-
+	struct work *ret = NULL;
+	HASH_FIND_INT(queue, &id, ret);
 	return ret;
 }
 

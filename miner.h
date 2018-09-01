@@ -1056,8 +1056,8 @@ extern int opt_T1Vol[];
 extern int opt_T1VID[];
 extern bool opt_T1auto;
 extern bool opt_T1_efficient;
-extern bool opt_T1_factory;
 extern bool opt_T1_performance;
+extern int opt_T1_target;
 #endif
 #ifdef USE_ANT_S1
 extern char *opt_bitmain_options;
@@ -1158,6 +1158,7 @@ bool submit_nonce2_nonce(struct thr_info *thr, struct pool *pool, struct pool *r
 #endif
 extern int restart_wait(struct thr_info *thr, unsigned int mstime);
 
+extern void raise_cgminer(void);
 extern void kill_work(void);
 
 extern void reinit_device(struct cgpu_info *cgpu);
@@ -1555,7 +1556,7 @@ extern void pool_died(struct pool *pool);
 extern struct thread_q *tq_new(void);
 extern void tq_free(struct thread_q *tq);
 extern bool tq_push(struct thread_q *tq, void *data);
-extern void *tq_pop(struct thread_q *tq, const struct timespec *abstime);
+extern void *tq_pop(struct thread_q *tq);
 extern void tq_freeze(struct thread_q *tq);
 extern void tq_thaw(struct thread_q *tq);
 extern bool successful_connect;

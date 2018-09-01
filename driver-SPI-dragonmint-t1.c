@@ -28,14 +28,9 @@
 
 #include "sys/time.h"
 
-#define T1_FANSPEED_INIT	(100)
+#define T1_FANSPEED_INIT	(opt_T1_target)
 #define T1_TEMP_TARGET_INIT	(60)
 #define T1_TEMP_TARGET_RUN	(75)
-
-#define T1_DIFF_TUNE		(129)
-#define T1_DIFF_1HR		(256)
-#define T1_DIFF_4HR		(512)
-#define T1_DIFF_RUN		(1024)
 
 struct T1_chain *chain[MAX_CHAIN_NUM];
 uint8_t chain_mask;
@@ -44,10 +39,6 @@ uint16_t T1Pll[MCOMPAT_CONFIG_MAX_CHAIN_NUM];
 
 /* FAN CTRL */
 //dragonmint_fan_temp_s g_fan_ctrl;
-static uint32_t show_log[MAX_CHAIN_NUM];
-static uint32_t update_cnt[MAX_CHAIN_NUM];
-static uint32_t write_flag[MAX_CHAIN_NUM];
-static uint32_t check_disable_flag[MAX_CHAIN_NUM];
 static volatile uint8_t g_debug_stats[MAX_CHAIN_NUM];
 
 static int total_chains;
@@ -220,9 +211,7 @@ static bool prechain_detect(struct T1_chain *t1, int idxpll)
 	if (opt_T1auto) {
 		/* Start tuning at a different voltage depending on tuning
 		 * strategy. */
-		if (opt_T1_factory)
-			opt_T1Vol[chain_id] = TUNE_VOLT_START_FAC;
-		else if (opt_T1_performance)
+		if (opt_T1_performance)
 			opt_T1Vol[chain_id] = TUNE_VOLT_START_PER;
 		else if (opt_T1_efficient)
 			opt_T1Vol[chain_id] = TUNE_VOLT_START_EFF;
@@ -304,14 +293,10 @@ static int chain_detect(struct T1_chain *t1)
 	return n_chips;
 }
 
-static struct T1_chain *pre_init_T1_chain(int chain_id)
+static bool prepare_T1(struct T1_chain *t1, int chain_id)
 {
-	uint8_t buffer[4] = {0};
-	struct T1_chain *t1 = cgcalloc(sizeof(*t1), 1);
-
-	t1->chain_id = chain_id;
-
-	applog(LOG_INFO, "pre %d: T1 init chain", t1->chain_id);
+	uint8_t buffer[4] = {};
+	bool ret = false;
 
 	//spi speed init
 	applog(LOG_NOTICE, "chain%d: spi speed set to 390K", chain_id);
@@ -320,11 +305,11 @@ static struct T1_chain *pre_init_T1_chain(int chain_id)
 
 	if (!dm_cmd_resetall(chain_id, CMD_ADDR_BROADCAST, buffer)) {
 		applog(LOG_ERR, "failed to reset chain %d!", chain_id);
-		goto failure;
+		goto out;
 	}
 	if (CMD_TYPE_T1 != (buffer[0] & 0xf0)) {
 		applog(LOG_ERR, "incompatible chip type %02X for chain %d!", buffer[0] & 0xf0, chain_id);
-		goto failure;
+		goto out;
 	}
 
 	t1->num_chips = chain_detect(t1);
@@ -341,7 +326,7 @@ static struct T1_chain *pre_init_T1_chain(int chain_id)
 				write_miner_ageing_status(AGEING_SPI_STATUS_ERROR);
 			}
 		}
-		goto failure;
+		goto out;
 	}
 
 	if (chain_id == (MAX_CHAIN_NUM - 1)){
@@ -359,15 +344,29 @@ static struct T1_chain *pre_init_T1_chain(int chain_id)
 		t1->num_chips > T1_config_options.override_chip_num) {
 		t1->num_active_chips = T1_config_options.override_chip_num;
 		applog(LOG_WARNING, "%d: limiting chain to %d chips",
-		       t1->chain_id, t1->num_active_chips);
+		       chain_id, t1->num_active_chips);
 	}
 
+	/* Free this in case we are re-initialising a chain */
+	free(t1->chips);
 	t1->chips = cgcalloc(t1->num_active_chips, sizeof(struct T1_chip));
-	return t1;
+	ret = true;
+out:
+	return ret;
+}
 
-failure:
-	exit_T1_chain(t1);
-	return NULL;
+static struct T1_chain *pre_init_T1_chain(int chain_id)
+{
+	struct T1_chain *t1 = cgcalloc(sizeof(*t1), 1);
+
+	applog(LOG_INFO, "pre %d: T1 init chain", chain_id);
+
+	t1->chain_id = chain_id;
+	if (!prepare_T1(t1, chain_id)) {
+		exit_T1_chain(t1);
+		t1 = NULL;
+	}
+	return t1;
 }
 
 static bool init_T1_chain(struct T1_chain *t1)
@@ -377,6 +376,7 @@ static bool init_T1_chain(struct T1_chain *t1)
 	uint8_t reg[REG_LENGTH] = {0};
 	int chain_id = t1->chain_id;
 	int num_chips;
+	bool ret = false;
 
 	applog(LOG_INFO, "%d: T1 init chain", chain_id);
 
@@ -404,12 +404,12 @@ static bool init_T1_chain(struct T1_chain *t1)
 
 	if (num_chips != 0 && num_chips != t1->num_chips) {
 		applog(LOG_WARNING, "T1 %d: Num chips failure", chain_id);
-		goto failure;
+		goto out;
 	}
 
 	if (!mcompat_cmd_bist_fix(chain_id, CMD_ADDR_BROADCAST)) {
 		write_miner_ageing_status(AGEING_BIST_FIX_FAILED);
-		goto failure;
+		goto out;
 	}
 
 	cgsleep_us(200);
@@ -424,26 +424,20 @@ static bool init_T1_chain(struct T1_chain *t1)
 		chain_id, s_reg_ctrl.highest_vol[chain_id], s_reg_ctrl.average_vol[chain_id],
 		s_reg_ctrl.lowest_vol[chain_id]);
 
+	/* Reset value in case we are re-initialising */
+	t1->num_cores = 0;
 	for (i = 0; i < t1->num_active_chips; i++)
 		check_chip(t1, i);
 
 	applog(LOG_WARNING, "%d: found %d chips with total %d active cores",
 	       chain_id, t1->num_active_chips, t1->num_cores);
 
-	INIT_LIST_HEAD(&t1->active_wq.head);
-
 	if (!opt_T1auto)
 		t1->VidOptimal = t1->pllOptimal = true;
-	else if (opt_T1_factory)
-		applog(LOG_NOTICE, "T1 chain %d applies factory tuning scheme", chain_id);
-	else
-		applog(LOG_NOTICE, "T1 chain %d applies ck tuning scheme", chain_id);
 
-	return true;
-
-failure:
-	exit_T1_chain(t1);
-	return false;
+	ret = true;
+out:
+	return ret;
 }
 
 /* Asynchronous work generation since get_work is a blocking function */
@@ -471,6 +465,20 @@ static void *T1_work_thread(void *arg)
 	return NULL;
 }
 
+static void start_T1_chain(int cid, int retries)
+{
+	mcompat_set_reset(cid, 1);
+	sleep(retries);
+	mcompat_set_power_en(cid, 1);
+	sleep(retries);
+	mcompat_set_reset(cid, 0);
+	sleep(retries);
+	mcompat_set_start_en(cid, 1);
+	sleep(retries);
+	mcompat_set_reset(cid, 1);
+	sleep(retries);
+}
+
 static bool detect_T1_chain(void)
 {
 	int i, retries, chain_num = 0, chip_num = 0, iPll;
@@ -482,10 +490,6 @@ static bool detect_T1_chain(void)
 		if (chain_plug[i] != 1)
 			continue;
 		chain_num++;
-		show_log[i] = 0;
-		update_cnt[i] = 0;
-		write_flag[i] = 0;
-		check_disable_flag[i] = 0;
 	}
 
 
@@ -497,19 +501,7 @@ static bool detect_T1_chain(void)
 				continue;
 			if (chain[i])
 				continue;
-			mcompat_set_reset(i, 1);
-			if (retries)
-				sleep(1);
-			mcompat_set_power_en(i, 1);
-			if (retries)
-				sleep(1);
-			mcompat_set_reset(i, 0);
-			if (retries)
-				sleep(1);
-			mcompat_set_start_en(i, 1);
-			if (retries)
-				sleep(1);
-			mcompat_set_reset(i, 1);
+			start_T1_chain(i, retries);
 
 			/* pre-init chain */
 			if ((chain[i] = pre_init_T1_chain(i))) {
@@ -569,6 +561,7 @@ static bool detect_T1_chain(void)
 			continue;
 
 		if (!init_T1_chain(chain[i])) {
+			exit_T1_chain(chain[i]);
 			applog(LOG_ERR, "init %d T1 chain fail", i);
 			chain_flag[i] = 0;
 			continue;
@@ -609,6 +602,8 @@ static bool detect_T1_chain(void)
 		mcompat_set_led(i, LED_ON);
 		applog(LOG_WARNING, "Detected the %d T1 chain with %d chips / %d cores",
 			i, chain[i]->num_active_chips, chain[i]->num_cores);
+
+		INIT_LIST_HEAD(&t1->active_wq.head);
 
 		mutex_init(&t1->lock);
 		pthread_cond_init(&t1->cond, NULL);
@@ -731,6 +726,37 @@ void T1_detect(bool hotplug)
 			set_timeout_on_i2c(30);
 		applog(LOG_WARNING, "T1 detect finish");
 	}
+}
+
+/* Exit cgminer on failure, allowing systemd watchdog to restart */
+static void reinit_T1_chain(struct T1_chain *t1, int cid)
+{
+	bool success = false;
+	struct timeval now;
+	int i;
+
+	applog(LOG_WARNING, "T1: %d attempting to re-initialise!", cid);
+	for (i = 0; i < 3; i++) {
+		start_T1_chain(cid, i);
+		if (prepare_T1(t1, cid)) {
+			success = true;
+			break;
+		}
+	}
+	if (!success) {
+		applog(LOG_EMERG, "T1: %d FAILED TO PREPARE, SHUTTING DOWN", cid);
+		raise_cgminer();
+	}
+	if (!prechain_detect(t1, T1Pll[cid])) {
+		applog(LOG_EMERG, "T1: %d FAILED TO PRECHAIN DETECT, SHUTTING DOWN", cid);
+		raise_cgminer();
+	}
+	if (!init_T1_chain(t1)) {
+		applog(LOG_EMERG, "T1: %d FAILED TO INIT, SHUTTING DOWN", cid);
+		raise_cgminer();
+	}
+	cgtime(&now);
+	t1->lastshare = now.tv_sec;
 }
 
 #define VOLTAGE_UPDATE_INT  121
@@ -1057,154 +1083,6 @@ tune_freq:
 	T1_tune_complete(t1, cid);
 }
 
-/*******************************************************************************
- * factory tuning start
- *******************************************************************************/
-static void T1_fac_set_optimal_vid(struct T1_chain *t1)
-{
-	int i, vid = t1->iVid;
-	double max_product = 0;
-	double hw_rate, min_rate = 0.2;	// result which makes hw rate > 20% is ignored
-	bool found = false;
-
-	// Find vid which makes minimal hw_error rate
-	for (i = 0; i < T1_VID_TUNE_RANGE; i++)
-	{
-		applog(LOG_ERR, "vid%d: volt=%.1f, product=%.5f, hwerr=%.5f",
-			T1_VID_MIN + i, t1->vidvol[i], t1->vidproduct[i], t1->vidhwerr[i]);
-		if (t1->vidhwerr[i] < 0.0005)
-			t1->vidhwerr[i] = 0.0005;
-		hw_rate = (t1->vidproduct[i] > 0.0000001) ?
-			(t1->vidhwerr[i] / t1->vidproduct[i]) : 1;
-		if (hw_rate < min_rate)
-		{
-			min_rate = hw_rate;
-			vid = T1_VID_MIN + i;
-			found = true;
-		}
-	}
-
-	// Select maximum product if none of vids makes 20% or lower hw_rate
-	if (!found)
-	{
-		for (i = 0; i < T1_VID_TUNE_RANGE; i++)
-		{
-			// '>=' ensures a lower vid result for the same product
-			if (t1->vidproduct[i] >= max_product)
-			{
-				max_product = t1->vidproduct[i];
-				vid = T1_VID_MIN + i;
-			}
-			/* Reset values for clean reuse */
-			t1->vidproduct[i] = 0;
-		}
-	}
-
-	// Set to best vid first to avoid failure in reading voltages
-	mcompat_set_vid_by_step(t1->chain_id, t1->iVid, vid);
-	// Voltage calibration: set to best average voltage
-	t1->iVid = mcompat_find_chain_vid(
-		t1->chain_id, t1->num_active_chips, vid, t1->vidvol[vid - T1_VID_MIN]);
-	// Set opt_T1Vol for saving to config file
-	opt_T1VID[t1->chain_id] = t1->iVid;
-	opt_T1Vol[t1->chain_id] = t1->vidvol[vid - T1_VID_MIN];
-
-	t1->optimalVid = t1->iVid;
-	t1->VidOptimal = true;
-}
-
-static void T1_factory_tune(struct T1_chain *t1)
-{
-	int i, hw_cnt, hw_diff;
-	double hwerr;
-	double product, tdiff;
-	struct timeval now;
-	int cid = t1->chain_id;
-
-	if (t1->pllOptimal)
-		return;
-
-	cgtime(&now);
-
-	if (unlikely(!t1->cycle_start.tv_sec)) {
-		copy_time(&t1->cycle_start, &now);
-		t1->cycles = 0;
-		return;
-	}
-
-	tdiff = ms_tdiff(&now, &t1->cycle_start);
-
-	/* Bring the tuning out of endless loop after chain shutdown due to low voltage */
-	if (!t1->VidOptimal && tdiff > T1_CYCLES_CHAIN * 200)	// threshold is 0.005 hashes per ms
-	{
-		applog(LOG_NOTICE, "chain%d testing iVid %d timeout, resuming from low voltage",
-			cid, t1->iVid);
-		goto tune_volt_done;
-	}
-
-	if (t1->cycles < T1_CYCLES_CHAIN)
-		return;
-
-	product = (double)t1->cycles / tdiff;
-
-	// hwerr stat.
-	hw_cnt = 0;
-	for(i = 0; i < t1->num_active_chips; ++i)
-		hw_cnt += t1->chips[i].hw_errors;
-	hw_diff = hw_cnt - t1->hw_errors;
-	t1->hw_errors = hw_cnt;
-	hwerr = (double) hw_diff / tdiff;
-
-	reset_tune(t1);
-
-	if (!t1->sampling) {
-		/* Discard the first lot of samples due to changing diff on
-		 * startup and possible init times invalidating data. */
-		t1->sampling = true;
-		return;
-	}
-
-	if (t1->VidOptimal)
-		goto tune_freq;
-
-	applog(LOG_NOTICE,
-		   "chain%d hw %d, vid %d, pll %d, %.1fms product %f, hw %f",
-	       cid, hw_diff, t1->iVid, t1->pll, tdiff, product, hwerr);
-
-	t1->vidproduct[t1->iVid] = product;
-	t1->vidhwerr[t1->iVid] = hwerr;
-	if (t1->iVid < T1_VID_MAX) {
-		t1->vidvol[t1->iVid] = s_reg_ctrl.average_vol[cid];
-		mcompat_set_vid(cid, ++t1->iVid);
-		cgsleep_ms(3000);
-		get_voltages(t1);
-		opt_T1Vol[cid] = s_reg_ctrl.average_vol[cid];
-		applog(LOG_NOTICE, "chain%d testing iVid %d Vavg %.0f Vmin %.0f",
-			   cid, t1->iVid, s_reg_ctrl.average_vol[cid], s_reg_ctrl.lowest_vol[cid]);
-		if (s_reg_ctrl.lowest_vol[cid] >= CHIP_VOLT_MIN
-			&& s_reg_ctrl.average_vol[cid] >= TUNE_VOLT_STOP)
-			return;
-	}
-
-tune_volt_done:
-	/* Now find the iVid that corresponds with highest product */
-	T1_fac_set_optimal_vid(t1);
-	cgsleep_ms(3000);
-	get_voltages(t1);	// update chip voltages
-	opt_T1Vol[cid] = s_reg_ctrl.average_vol[cid];
-	applog(LOG_NOTICE, "chain%d optimal iVid set to %d, Vavg %.0f Vmin %.0f",
-	       cid, t1->iVid, s_reg_ctrl.average_vol[cid], s_reg_ctrl.lowest_vol[cid]);
-	return;
-
-tune_freq:
-	/* Don't do pll tuning */
-	T1_tune_complete(t1, cid);
-	t1->pllOptimal = true;
-}
-
-/******************************************************************************
- * factory tuning end
- ******************************************************************************/
 #define MAX_NONCE_SLEEP		(100)
 #define T1_THROTTLE_INTERVAL	(5)
 #define T1_RAISE_INTERVAL	(15)
@@ -1251,7 +1129,7 @@ static void t1_raise(struct T1_chain *t1, int cid)
 	}
 }
 
-#define MAX_CMD_FAILS		(20)
+#define MAX_CMD_FAILS		(0)
 #define MAX_CMD_RESETS		(50)
 
 static int g_cmd_fails[MAX_CHAIN_NUM];
@@ -1291,27 +1169,13 @@ static int64_t T1_scanwork(struct thr_info *thr)
 
 	if (unlikely((t1->num_cores == 0) || (t1->num_cores > MAX_CORES))) {
 		cgpu->deven = DEV_DISABLED;
-		return 0;
-	}
-
-	/* We start with low diff to speed up tuning and increase hashrate
-	 * resolution reported and then increase diff after an hour to decrease
-	 * load. */
-	cgtime(&now);
-	if (cgpu->drv->max_diff < T1_DIFF_RUN) {
-		int hours;
-
-		hours = tdiff(&now, &cgpu->dev_start_tv) / 3600;
-		if (hours > 8)
-			cgpu->drv->max_diff = T1_DIFF_RUN;
-		else if (hours > 4 && cgpu->drv->max_diff < T1_DIFF_4HR)
-			cgpu->drv->max_diff = T1_DIFF_4HR;
-		else if (hours > 1 && cgpu->drv->max_diff < T1_DIFF_1HR)
-			cgpu->drv->max_diff =T1_DIFF_1HR;
+		return -1;
 	}
 
 	/* Spurious wakeups are harmless */
 	pthread_cond_signal(&t1->cond);
+
+	cgtime(&now);
 
 	/* Poll queued results. A full nonce range takes about 200ms to scan so
 	 * we're unlikely to need more work until then. Poll every 10ms for up
@@ -1383,10 +1247,9 @@ static int64_t T1_scanwork(struct thr_info *thr)
 	}
 
 	if (unlikely(now.tv_sec - t1->lastshare > 300)) {
-		applog(LOG_EMERG, "T1 chain %d not producing shares for more than 5 mins, shutting down.",
+		applog(LOG_EMERG, "T1 chain %d not producing shares for more than 5 mins.",
 		       cid);
-		/* Exit cgminer, allowing systemd watchdog to restart */
-		kill_work(); // Does not return
+		reinit_T1_chain(t1, cid);
 	}
 
 	cgsleep_prepare_r(&t1->cgt);
@@ -1424,6 +1287,9 @@ static int64_t T1_scanwork(struct thr_info *thr)
 		reset_tune(t1);
 	}
 
+	/* Clean spi buffer before read 0a reg */
+	hub_spi_clean_chain(cid);
+
 	if (thr->work_restart || mcompat_cmd_read_register(cid, MAX_CHIP_NUM >> 1, reg, REG_LENGTH)) {
 		uint8_t qstate = reg[9] & 0x03;
 
@@ -1434,7 +1300,6 @@ static int64_t T1_scanwork(struct thr_info *thr)
 		/* qstate will always be 0x0 when work_restart is set */
 		if (qstate != 0x03) {
 			if (qstate == 0x0) {
-				//applog(LOG_NOTICE, "qstate == 0x0,the number of work is %d. \t", t1->active_wq.num_elems);
 				for (i = t1->num_active_chips; i > 0; i--) {
 					struct T1_chip *chip = &t1->chips[i - 1];
 					struct work *work = wq_dequeue(t1, true);
@@ -1472,27 +1337,12 @@ static int64_t T1_scanwork(struct thr_info *thr)
 		if (g_cmd_fails[cid] > MAX_CMD_FAILS) {
 			// TODO: replaced with mcompat_spi_reset()
 			applog(LOG_ERR, "Chain %d reset spihub", cid);
-//			hub_spi_reset(cid);
 			hub_spi_clean_chain(cid);
-//			g_cmd_fails[cid] = 0;
 			g_cmd_resets[cid]++;
 			if (g_cmd_resets[cid] > MAX_CMD_RESETS) {
-				applog(LOG_ERR, "Chain %d is not working due to multiple resets. shutdown.",
+				applog(LOG_ERR, "Chain %d is not working due to multiple resets.",
 				       cid);
-				/* Exit cgminer, allowing systemd watchdog to
-				 * restart */
-				kill_work();
-#if 0
-				g_cmd_fails[cid] = 0;
-				g_cmd_resets[cid] = 0;
-				// TODO: restart chain
-				mcompat_chain_power_down(cid);
-				cgpu->status = LIFE_DEAD;
-				cgtime(&thr->sick);
-				while (42) {
-					cgsleep_ms(1000);
-				}
-#endif
+				reinit_T1_chain(t1, cid);
 			}
 		}
 	}
@@ -1515,18 +1365,16 @@ static int64_t T1_scanwork(struct thr_info *thr)
 
 		/* Function doesn't currently return */
 		T1_overheated_blinking(cid);
-	} else if (chain_temp_status == TEMP_WARNING)
-		t1_throttle(t1, cid);
-	else if (t1->throttled && chain_temp_status == TEMP_NORMAL)
-		t1_raise(t1, cid);
+	} else if (chain_temp_status == TEMP_WARNING ||
+		   (g_chain_tmp[cid].optimal && g_fan_cfg.fan_speed > opt_T1_target))
+			t1_throttle(t1, cid);
+	else if (t1->throttled && chain_temp_status == TEMP_NORMAL &&
+		 g_fan_cfg.fan_speed < opt_T1_target)
+			t1_raise(t1, cid);
 
 	/* Tuning */
-	if (!thr->work_restart && !t1->throttled && opt_T1auto) {
-		if (opt_T1_factory)
-			T1_factory_tune(t1);
-		else
-			T1_tune(t1, cid);
-	}
+	if (!thr->work_restart && !t1->throttled && opt_T1auto)
+		T1_tune(t1, cid);
 
 	/* read chip temperatures and voltages */
 	if (g_debug_stats[cid]) {
@@ -1562,8 +1410,9 @@ static void T1_shutdown(struct thr_info *thr)
 	struct T1_chain *t1 = cgpu->device_data;
 	int cid = t1->chain_id;
 
-	/* Set a very low frequency. Ignore the return value as often it will
-	 * refuse to go back to 0 on the way down. */
+	mcompat_set_spi_speed(cid, T1_SPI_SPEED_DEF);
+
+	/* Set a very low frequency. */
 	t1_set_pll(t1, CMD_ADDR_BROADCAST, 0);
 
 	/* Set a very low voltage */
@@ -1678,9 +1527,8 @@ struct device_drv dragonmintT1_drv = {
 	.dname = "DragonmintT1",
 	.name = "DT1",
 	.drv_detect = T1_detect,
-	/* Set to lowest diff we can reliably use to get accurate hashrates
-	 * during tuning and initially. */
-	.max_diff = T1_DIFF_TUNE,
+	/* Set to lowest diff we can reliably use to get accurate hashrates. */
+	.max_diff = 129,
 
 	.hash_work = hash_driver_work,
 	.scanwork = T1_scanwork,

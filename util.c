@@ -1194,7 +1194,7 @@ bool tq_push(struct thread_q *tq, void *data)
 	return rc;
 }
 
-void *tq_pop(struct thread_q *tq, const struct timespec *abstime)
+void *tq_pop(struct thread_q *tq)
 {
 	struct tq_ent *ent;
 	void *rval = NULL;
@@ -1204,10 +1204,7 @@ void *tq_pop(struct thread_q *tq, const struct timespec *abstime)
 	if (!list_empty(&tq->q))
 		goto pop;
 
-	if (abstime)
-		rc = pthread_cond_timedwait(&tq->cond, &tq->mutex, abstime);
-	else
-		rc = pthread_cond_wait(&tq->cond, &tq->mutex);
+	rc = pthread_cond_wait(&tq->cond, &tq->mutex);
 	if (rc)
 		goto out;
 	if (list_empty(&tq->q))
@@ -1390,6 +1387,13 @@ char *Strsep(char **stringp, const char *delim)
 	return ret;
 }
 
+/* Get timespec specifically for use by cond_timedwait functions which use
+ * CLOCK_REALTIME for expiry */
+void cgcond_time(struct timespec *abstime)
+{
+	clock_gettime(CLOCK_REALTIME, abstime);
+}
+
 #ifdef WIN32
 /* Mingw32 has no strsep so create our own custom one  */
 
@@ -1429,7 +1433,10 @@ void cgtime(struct timeval *tv)
 #else /* WIN32 */
 void cgtime(struct timeval *tv)
 {
-	gettimeofday(tv, NULL);
+	cgtimer_t cgt;
+
+	cgtimer_time(&cgt);
+	timespec_to_val(tv, &cgt);
 }
 
 int cgtimer_to_ms(cgtimer_t *cgt)
@@ -3568,15 +3575,13 @@ retry:
 
 int _cgsem_mswait(cgsem_t *cgsem, int ms, const char *file, const char *func, const int line)
 {
-	struct timespec abs_timeout, ts_now;
-	struct timeval tv_now;
+	struct timespec abs_timeout, tdiff;
 	int ret;
 
-	cgtime(&tv_now);
-	timeval_to_spec(&ts_now, &tv_now);
-	ms_to_timespec(&abs_timeout, ms);
+	cgcond_time(&abs_timeout);
+	ms_to_timespec(&tdiff, ms);
+	timeraddspec(&abs_timeout, &tdiff);
 retry:
-	timeraddspec(&abs_timeout, &ts_now);
 	ret = sem_timedwait(cgsem, &abs_timeout);
 
 	if (ret) {
